@@ -1,17 +1,4 @@
-'''
-Gravitational-wave selection effects using neural-network classifiers
-Davide Gerosa, Birmingham UK, 2020.
-
-We are very happy if you want to use this code for your research.
-Please cite our paper: arXiv:2007.06585.
-'''
-
-__author__='Davide Gerosa'
-__email__='d.gerosa@bham.ac.uk'
-__version__=0.2
-__license__='MIT'
-
-import sys,os,time,copy
+import sys, os, time,copy
 from tqdm import tqdm
 
 import numpy as np
@@ -24,11 +11,16 @@ import pycbc.detector
 import pycbc.waveform
 import pycbc.filter
 
-import tensorflow as tf
-from tensorflow import keras
+# Multi-processing
+from schwimmbad import MultiPool
 
-import uuid
-import deepdish
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch import optim
+from torch.utils import data
+
+import pickle
 
 
 def sperical_to_cartesian(mag,theta,phi):
@@ -103,103 +95,129 @@ def generate_binaries(N):
 
     return binaries
 
-
-def evaluate_binaries(inbinaries, approximant='IMRPhenomXPHM', noisecurve='design', SNRthreshold=12):
-    '''
-    Compute the SNRs of a set of binaries
-    '''
-
-    binaries = copy.deepcopy(inbinaries)
-
-    ifos=['H1','L1','V1']
-    flow=20.0
-    fhigh=2048.
-    geocent_time=0.
-    delta_f=1/64.
-    flen=int(fhigh / delta_f) + 1
-    phi_c=0.
-
-    dets=[]
+def get_psds(ifos, flow, delta_f, flen, noisecurve="design"):
     psds=[]
     for ifo in ifos:
-        dets.append(pycbc.detector.Detector(ifo))
-
-
         if noisecurve=="design" or noisecurve=="Design":
             if ifo == 'V1':
-               psds.append(pycbc.psd.AdVDesignSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.AdVDesignSensitivityP1200087(flen, delta_f, flow) )
             else:
-               psds.append(pycbc.psd.aLIGODesignSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.aLIGODesignSensitivityP1200087(flen, delta_f, flow) )
 
         elif noisecurve=="O1O2":
             if ifo == 'V1':
-               psds.append(pycbc.psd.AdVEarlyHighSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.AdVEarlyHighSensitivityP1200087(flen, delta_f, flow) )
             else:
-               psds.append(pycbc.psd.aLIGOEarlyHighSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.aLIGOEarlyHighSensitivityP1200087(flen, delta_f, flow) )
 
         elif noisecurve=="O3":
             if ifo == 'H1':
-               psds.append(pycbc.psd.from_txt('./T2000012_aligo_O3actual_H1.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('./T2000012_aligo_O3actual_H1.txt', flen, delta_f,flow, is_asd_file=True) )
             elif ifo=='L1':
-               psds.append(pycbc.psd.from_txt('./T2000012_aligo_O3actual_L1.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('./T2000012_aligo_O3actual_L1.txt', flen, delta_f,flow, is_asd_file=True) )
             elif ifo=='V1':
-               psds.append(pycbc.psd.from_txt('./T2000012_avirgo_O3actual.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('./T2000012_avirgo_O3actual.txt', flen, delta_f,flow, is_asd_file=True) )
 
         elif noisecurve=="O4":
             if ifo == 'V1':
                 psds.append(pycbc.psd.from_txt('./T2000012_avirgo_O4high_NEW.txt', flen, delta_f,flow, is_asd_file=True) )
             else:
                 psds.append(pycbc.psd.from_txt('./T2000012_aligo_O4high.txt', flen, delta_f,flow, is_asd_file=True) )
-
         else:
             raise ValueError
-    # Some derived quantities
-    m1z = binaries['mtot']/(1+binaries['q'])
-    m2z = binaries['q']*m1z
-    lumdist = astropy.cosmology.Planck15.luminosity_distance(binaries['z']).value # Mpc
 
-    binaries['snr']=[]
-    for i in tqdm(range(binaries['N'])):
-        # Waveform generator
-        hp, hc = pycbc.waveform.get_fd_waveform(approximant = approximant,
-                            mass1       = m1z[i],
-                            mass2       = m2z[i],
-                            spin1x      = binaries['chi1x'][i],
-                            spin1y      = binaries['chi1y'][i],
-                            spin1z      = binaries['chi1z'][i],
-                            spin2x      = binaries['chi2x'][i],
-                            spin2y      = binaries['chi2y'][i],
-                            spin2z      = binaries['chi2z'][i],
-                            inclination = binaries['iota'][i],
-                            coa_phase   = phi_c,
-                            delta_f     = delta_f,
-                            f_lower     = flow,
-                            distance    = lumdist[i]
-                            )
+    return psds
 
-        # Compute SNR for each specified detector
-        snrs = []
-        for det,psd in zip(dets,psds):
+def calculate_snr(args):
+    binaries, ifos, approximant, noisecurve = args
+    dets = []
+    for ifo in ifos:
+        dets.append(pycbc.detector.Detector(ifo))
+    psds = get_psds(ifos, binaries['flow'], binaries['delta_f'], binaries['flen'], noisecurve)
 
-            f_plus, f_cross = det.antenna_pattern(binaries['ra'][i],binaries['dec'][i],binaries['psi'][i],geocent_time)
-            template = f_plus * hp + f_cross * hc
-            dt = det.time_delay_from_earth_center(binaries['ra'][i],binaries['dec'][i],geocent_time)
-            template = template.cyclic_time_shift(dt)
-            template.resize(len(hp) // 2 + 1)
-            snr_opt = pycbc.filter.matched_filter(template, template,
-                    psd = psd,
-                    low_frequency_cutoff  = flow,
-                    high_frequency_cutoff = fhigh - 0.5)
-            maxsnr, _ = snr_opt.abs_max_loc()
-            snrs.append(maxsnr)
+    # Waveform generator
+    hp, hc = pycbc.waveform.get_fd_waveform(approximant = approximant,
+                        mass1       = binaries['m1z'],
+                        mass2       = binaries['m2z'],
+                        spin1x      = binaries['chi1x'],
+                        spin1y      = binaries['chi1y'],
+                        spin1z      = binaries['chi1z'],
+                        spin2x      = binaries['chi2x'],
+                        spin2y      = binaries['chi2y'],
+                        spin2z      = binaries['chi2z'],
+                        inclination = binaries['iota'],
+                        coa_phase   = binaries['phi_c'],
+                        delta_f     = binaries['delta_f'],
+                        f_lower     = binaries['flow'],
+                        distance    = binaries['lumdist'],
+                        )
 
-        # Sum in quarature for the network SNR
-        binaries['snr'].append(np.linalg.norm(snrs))
+    # Compute SNR for each specified detector
+    snrs = []
+    for det,psd in zip(dets,psds):
+        f_plus, f_cross = det.antenna_pattern(binaries['ra'],binaries['dec'],binaries['psi'],binaries['geocent_time'])
+        template = f_plus * hp + f_cross * hc
+        dt = det.time_delay_from_earth_center(binaries['ra'],binaries['dec'],binaries['geocent_time'])
+        template = template.cyclic_time_shift(dt)
+        template.resize(len(hp) // 2 + 1)
+        snr_opt = pycbc.filter.matched_filter(template, template,
+                psd = psd,
+                low_frequency_cutoff  = binaries['flow'],
+                high_frequency_cutoff = binaries['fhigh'] - 0.5)
+        maxsnr, _ = snr_opt.abs_max_loc()
+        snrs.append(maxsnr)
 
-    binaries['snr']=np.array(binaries['snr'])
+    # Sum in quarature for the network SNR
+    # np.linalg.norm(snrs)
+    # Return the SNR in each detector and construct the network SNR later on
+    return snrs
+
+def evaluate_binaries(inbinaries, ncore=1, approximant='IMRPhenomXPHM', noisecurve='design', SNRthreshold=12):
+    '''
+    Compute the SNRs of a set of binaries
+    '''
+
+    binaries = copy.deepcopy(inbinaries)
+    
+    # Prepare detectors and PSDs
+    ifos=['H1','L1','V1']
+
+    # Populate binaries with additional parameters
+    # NOTE These hyperparameters should also be binary dependent!
+    flow=20.0
+    fhigh=2048.
+    geocent_time=0.
+    delta_f=1/64.
+    flen=int(fhigh / delta_f) + 1
+    phi_c=0.
+    
+    binaries['flow'] = np.ones(binaries['N'])*flow
+    binaries['fhigh'] = np.ones(binaries['N'])*fhigh
+    binaries['geocent_time'] = np.ones(binaries['N'])*geocent_time
+    binaries['delta_f'] = np.ones(binaries['N'])*delta_f
+    binaries['flen'] = np.ones(binaries['N'], dtype=int)*flen
+    binaries['phi_c'] = np.ones(binaries['N'])*phi_c
+    binaries['m1z'] = binaries['mtot']/(1+binaries['q'])
+    binaries['m2z'] = binaries['q']*binaries['m1z']
+    binaries['lumdist'] = astropy.cosmology.Planck15.luminosity_distance(binaries['z']).value # Mpc
+
+    with MultiPool(ncore) as pool:
+        output_snrs = list(
+            tqdm(
+                pool.imap(
+                    calculate_snr,
+                    [({k: binaries[k][i] for k in binaries.keys() if k != 'N'}, ifos, approximant, noisecurve) for i in range(binaries['N'])],
+                ),
+                total=binaries['N'],
+            )
+        )
+
+    binaries['snr']=np.array(output_snrs)
+    binaries['network_snr'] = np.linalg.norm(binaries['snr'], axis=1)
 
     # Detectability: 1 means "detected", 0 means "not detected"
-    binaries['det']= np.where(binaries['snr']>SNRthreshold , 1,0 )
+    # NOTE Maybe implement "Quick recipes for gravitational-wave selection effects" here
+    binaries['det']= np.where(binaries['network_snr']>SNRthreshold , 1,0 )
 
     return binaries
 
@@ -209,24 +227,31 @@ def store_binaries(filename, N, approximant='IMRPhenomXPHM', noisecurve='design'
     inbinaries = generate_binaries(N)
     outbinaries = evaluate_binaries(inbinaries, approximant, noisecurve, SNRthreshold)
 
-    deepdish.io.save(filename,outbinaries)
+    with open(filename, "wb") as f:
+        pickle.dump(outbinaries, f)
+
     return filename
 
-def readsample(filename='sample.h5'):
+def readsample(filename):
     '''
     Read a validation sample that already exists
     '''
-    return deepdish.io.load(filename)
+    with open(filename, "rb") as f:
+        binaries = pickle.load(f)
+
+    return binaries
 
 def splittwo(binaries):
     '''
-    Split sample into two subsamples of equal size
+    Split sample into two subsamples of (almost) equal size
     '''
 
     one={}
     two={}
-    for k in train_variables+['snr','det']:
-        one[k],two[k] = np.split(binaries[k],2)
+    for k in binaries.keys():
+        if k == 'N':
+            continue
+        one[k],two[k] = np.array_split(binaries[k],2)
     one['N'],two['N']= len(one['mtot']),len(two['mtot'])
 
     return one,two
@@ -258,112 +283,164 @@ def nnet_out(binaries, which='detnetwork'):
 
     return binaries['det']
 
+class LabeledDataset(data.Dataset):
+    def __init__(self, inputs, labels):
+        self.inputs = inputs
+        self.labels = labels
+        self.length = len(inputs)
+ 
+    def __getitem__(self, idx):
+        return self.inputs[idx], self.labels[idx]
+    
+    def __len__(self):
+        return self.length
 
-def trainnetwork(train_binaries,test_binaries,filename='trained.h5'):
+def trainnetwork_with_torch(train_binaries, test_binaries, filename='train.pt'):
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    # Set default dtype
+    torch.set_default_dtype(torch.float32)
+
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
 
     if not os.path.isfile(filename):
-
-        train_in  = nnet_in(train_binaries)
-        train_out = nnet_out(train_binaries)
-        test_in  = nnet_in(test_binaries)
+        train_in = nnet_in(train_binaries) # binary parameters
+        train_out = nnet_out(train_binaries) # detectable or not
+        test_in = nnet_in(test_binaries)
         test_out = nnet_out(test_binaries)
 
-        # Kernel initializer
-        my_init = keras.initializers.glorot_uniform(seed=1)
+        nfeatures = np.shape(train_in)[1] # Number of binary parameters
         # Define neural network architecture
-        model = keras.Sequential([
-            # Input layer, do not change
-            tf.keras.layers.InputLayer(input_shape=np.shape(train_in[0])),
-            # Inner layers, can add/change
-            keras.layers.Dense(32,  activation='tanh',kernel_initializer=my_init),
-            #keras.layers.Dense(16,  activation='tanh',kernel_initializer=my_init),
-            #keras.layers.Dense(8,  activation='tanh',kernel_initializer=my_init),
-            # Output layer, do not change
-            keras.layers.Dense(1, activation='sigmoid',kernel_initializer=my_init)])
+        model = nn.Sequential(
+            nn.Linear(nfeatures, 32),
+            nn.Tanh(),
+            nn.Linear(32, 16),
+            nn.Tanh(),
+            nn.Linear(16, 8),
+            nn.Tanh(),
+            nn.Linear(8, 1),
+            nn.Sigmoid(),
+        )
 
-        model.compile(
-            # Optimization algorithm, specify learning rate
-            optimizer=keras.optimizers.Adam(learning_rate=1e-2),
-            # Loss function for a binary classifier
-            loss='binary_crossentropy',
-            # Diagnostic quantities
-            metrics=['accuracy'])
+        # Initialize the weights for the linear layers
+        model.apply(init_weights)
+        # Move model to device (GPU or CPU)
+        model.to(device)
 
-        # Decrease the learning rate exponentially after the first 10 epochs
-        def scheduler(epoch, lr):
-            if epoch < 10:
-                return lr
-            else:
-                return lr * tf.math.exp(-0.05)
+        # Prepare the data and move to device
+        train_in = torch.from_numpy(train_in.astype(np.float32)).to(device)
+        train_out = torch.from_numpy(train_out.astype(np.float32)).to(device) # Either 0 or 1
+        test_in = torch.from_numpy(test_in.astype(np.float32)).to(device)
+        test_out = torch.from_numpy(test_out.astype(np.float32)).to(device)
+        train_dataset = LabeledDataset(train_in, train_out)
+        test_dataset = LabeledDataset(test_in, test_out)
 
-        # Actual Training
-        history = model.fit(
-            # Training inputs
-            train_in,
-            # Training outputs
-            train_out,
-            # Evaluate test set at each epoch
-            validation_data=(test_in, test_out),
-            # Batch size, default is 32
-            #batch_size=32,
-            # Number of epochs
-            epochs=150,
-            # Store the model with the best validation accuracy
-            callbacks = [
-                # Drecrease learning rate
-                tf.keras.callbacks.LearningRateScheduler(scheduler),
-                # Store the model with the best validation accuracy
-                tf.keras.callbacks.ModelCheckpoint(
-                    filepath=filename,
-                    save_weights_only=False,
-                    monitor='val_accuracy',
-                    mode='max',
-                    save_best_only=True),
-                # Save logfiles for tensorboard
-                tf.keras.callbacks.TensorBoard(log_dir="logs"+filename.split('.h5')[0], histogram_freq=1)],
-            # Shuffle data at each epoch
-            shuffle=True)
+        train_batch_size = 1024
+        validate_batch_size = train_batch_size
+        train_dataloader = data.DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            shuffle=True,
+        )
+        test_dataloader = data.DataLoader(
+            test_dataset,
+            batch_size=validate_batch_size,
+            shuffle=True,
+        )
 
-        # Store the last (not necessarily the best) iteration
-        #model.save(filename)
+        # Loss function: binary cross entropy
+        loss_fn = nn.BCELoss()
 
-    model = loadnetwork(filename)
+        lr = 1e-2 # learning rate
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        nepoch = 150
+        # Trying to reproduce Davide's learning rate schedule with torch
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[
+                optim.lr_scheduler.ConstantLR(optimizer, factor=1, total_iters=10),
+                optim.lr_scheduler.ExponentialLR(optimizer, gamma=np.exp(-0.05)),
+            ],
+            milestones=[10],
+        )
+        tbar = tqdm(range(nepoch))
+
+        # Training loop
+        best_score = -np.inf
+        for step in tbar:
+            # In each epoch
+            model.train()
+
+            for _, batch_data in enumerate(train_dataloader):
+                batch_in, batch_label = batch_data
+                optimizer.zero_grad()
+                output = model(batch_in).squeeze()
+                loss = loss_fn(output, batch_label)
+                loss.backward()
+                optimizer.step()
+
+            # Check for accuracy on the validation set
+            model.eval()
+            with torch.no_grad():
+                test_accuracy = []
+                for _, batch_data in enumerate(test_dataloader):
+                    batch_in, batch_label = batch_data
+                    test_output = model(batch_in).squeeze()
+                    test_accuracy.append(((test_output > 0.5) == batch_label).float().mean().item())
+                test_accuracy = np.mean(test_accuracy)
+                print("Current test accuracy: ", test_accuracy)
+                print("Previous best score: ", best_score)
+                if test_accuracy > best_score:
+                    best_score = test_accuracy
+                    torch.save(model, filename)
+
+            scheduler.step()
+    else:
+        model = torch.load(filename)
+
     return model
-
 
 def loadnetwork(filename,verbose=False):
     '''
     Load a trained neural network
     '''
 
-    model = tf.keras.models.load_model(filename)
+    model = torch.load(filename)
     if verbose:
-        model.summary()
+        print(model.__str__())
 
     return model
-
-
-def testnetwork(model,binaries):
-   '''
-   Test network on a series of binaries
-   '''
-   test_in  = nnet_in(binaries)
-   test_out = nnet_out(binaries)
-   model.evaluate(test_in,  test_out, verbose=2)
 
 
 def predictnetwork(model, binaries):
     '''
     Use a network to predict the detectability of a set of binaries.
     '''
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    inputs = torch.from_numpy(nnet_in(binaries).astype(np.float32)).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        pass
     # Return the class (0 or 1) that is preferred
-    predictions = np.squeeze((model.predict(nnet_in(binaries)) > 0.5).astype("int32"))
+    predictions = np.squeeze((model(inputs) > 0.5).detach().cpu().numpy().astype("int32"))
     return predictions
 
-
-def pdet(model,binaries, Nmc = 10000):
+def keep_splitting(binaries, target_N):
     '''
-    Numberical marginalization over the extrinsic parameters. Nmc is the nubmer of Monte Carlo samples used to estimate the integral.
+    Split a sample until the number of binaries in each split is less than or equal to target_N
+    '''
+
+    if binaries['N']<=target_N:
+        return [binaries]
+
+    split = splittwo(binaries)
+    return keep_splitting(split[0], target_N) + keep_splitting(split[1], target_N)
+
+def _pdet(model,binaries, Nmc = 10000):
+    '''
+    Numerical marginalization over the extrinsic parameters. Nmc is the nubmer of Monte Carlo samples used to estimate the integral.
     '''
 
     limits = lookup_limits()
@@ -384,87 +461,30 @@ def pdet(model,binaries, Nmc = 10000):
     extr = np.reshape(np.repeat([rescale(extrinsic[k],k) for k in extrvar],N,axis=0), (len(extrvar),N*Nmc))
     # Pair
     both = np.concatenate((intr,extr)).T
-    # Apply network
-    predictions =  np.reshape( np.squeeze(( model.predict(both)> 0.5).astype("int32")), (N,Nmc) )
+
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    both = torch.from_numpy(both.astype(np.float32)).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        # Apply network
+        predictions =  np.reshape( np.squeeze(( model(both)> 0.5).detach().cpu().numpy().astype("int32")), (N,Nmc) )
+
     # Approximante integral with monte carlo sum
-    pdet = np.sum(predictions,axis=1)/Nmc
+    pdet_mc = np.sum(predictions,axis=1)/Nmc
 
-    return pdet
+    del both
+    torch.cuda.empty_cache() # Clean up cache
 
+    return pdet_mc
 
+def pdet(model, binaries, Nmc=10000, nperbatch=1000):
+    # Depending on how much the GPU can handle,
+    # we can split the binaries into *bigger* chunks
+    splitted_binaries = keep_splitting(binaries, int(nperbatch))
 
-if __name__ == '__main__':
+    predictions = np.array([])
+    for binaries in tqdm(splitted_binaries):
+        predictions = np.append(predictions, _pdet(model, binaries, Nmc=Nmc))
 
-    if False:
-
-        # Load sample
-        binaries= readsample('sample_2e7_design_precessing_higherordermodes_3detectors.h5')
-        # Split test/training
-        train_binaries,test_binaries=splittwo(binaries)
-        # Load trained network
-        model = loadnetwork('trained_2e7_design_precessing_higherordermodes_3detectors.h5')
-        # Evaluate performances on training sample
-        testnetwork(model,train_binaries)
-        # Evaluate performances on test sample
-        testnetwork(model,test_binaries)
-        # Predict on new sample
-        newbinaries = generate_binaries(100)
-        predictions = predictnetwork(model, newbinaries)
-        print(predictions)
-        # Regenerate the extrinsic angles and marginalize over them
-        pdets = pdet(model,newbinaries, Nmc=1000)
-        print(pdets)
-
-
-    if False:
-
-        # Generate and store a sample
-        store_binaries('sample.h5',1e3,approximant='IMRPhenomXPHM',noisecurve='design',SNRthreshold=12)
-        # Load sample
-        binaries= readsample('sample.h5')
-        # Split test/training
-        train_binaries,test_binaries=splittwo(binaries)
-        # Train a neural network
-        trainnetwork(train_binaries,test_binaries,filename='trained.h5')
-        # Load trained network
-        model = loadnetwork('trained.h5')
-        # Evaluate performances on training sample
-        testnetwork(model,train_binaries)
-        # Evaluate performances on test sample
-        testnetwork(model,test_binaries)
-        # Predict on new sample
-        newbinaries = generate_binaries(100)
-        predictions = predictnetwork(model, newbinaries)
-        print(predictions)
-        # Regenerate the extrinsic angles and marginalize over them
-        pdets = pdet(model,newbinaries, Nmc=1000)
-        print(pdets)
-
-
-
-    if True:
-
-        #
-        # Initialize
-        binaries={}
-        N = int(1e3)
-        binaries = generate_binaries(N)
-        # Populate with your distribution
-        binaries['mtot'] = np.random.normal(30, 3, N )
-        binaries['q'] = np.random.uniform(0.1,1,N)
-        binaries['z'] = np.random.normal(0.2, 0.01, N )
-        binaries['chi1x'] = np.random.uniform(0, 0.1, N )
-        binaries['chi1y'] = np.random.uniform(0, 0.1, N )
-        binaries['chi1z'] = np.random.uniform(0, 0.1, N )
-        binaries['chi2x'] = np.random.uniform(0, 0.1, N )
-        binaries['chi2y'] = np.random.uniform(0, 0.1, N )
-        binaries['chi2z'] = np.random.uniform(0, 0.1, N )
-        # Load trained network
-        model = loadnetwork('trained_2e7_design_precessing_higherordermodes_3detectors.h5')
-        # Compute detectability averaged over extrinsic parameters
-        pdets = pdet(model,binaries, Nmc=1000)
-        print(pdets)
-        # Integrate over entire population
-        predictions = predictnetwork(model, binaries)
-        integral = np.sum(predictions)/N
-        print(integral)
+    return predictions
