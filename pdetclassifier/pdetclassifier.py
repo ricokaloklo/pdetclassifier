@@ -1,7 +1,6 @@
-import os, copy
+import os, copy, pathlib
 import pickle
 from tqdm import tqdm
-from schwimmbad import MultiPool
 
 import numpy as np
 import astropy.cosmology
@@ -17,12 +16,18 @@ from torch.nn import functional as F
 from torch import optim
 from torch.utils import data
 
+import pdetclassifier
+
 # Specify the parameterization
 massvar = ['mtot','q','z']
 spinvar = ['chi1x','chi1y','chi1z','chi2x','chi2y','chi2z']
 intrvar = massvar + spinvar
 extrvar = ['iota','ra','dec','psi']
 train_variables = intrvar + extrvar
+
+def get_data_folder_path():
+    module_path = pathlib.Path(pdetclassifier.__file__).resolve().parent
+    return os.path.join(module_path, "data/")
 
 def lookup_limits():
     '''
@@ -91,31 +96,48 @@ def generate_binaries(N):
 def get_psds(ifos, flow, delta_f, flen, noisecurve="design"):
     psds=[]
     for ifo in ifos:
+        if isinstance(noisecurve, dict):
+            if ifo not in noisecurve:
+                raise ValueError(f"ASD for {ifo} not specified in the noisecurve")
+            # NOTE We assume that ASD is given, not PSD
+            psds.append(pycbc.psd.from_txt(noisecurve[ifo], flen, delta_f, flow, is_asd_file=True))
+            continue
+
         if noisecurve=="design" or noisecurve=="Design":
             if ifo == 'V1':
-                psds.append(pycbc.psd.AdVDesignSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.AdVDesignSensitivityP1200087(flen, delta_f, flow))
             elif ifo == 'H1' or ifo == 'L1':
-                psds.append(pycbc.psd.aLIGODesignSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.aLIGODesignSensitivityP1200087(flen, delta_f, flow))
 
-        elif noisecurve=="O1O2":
+        elif noisecurve=="O1O2" or noisecurve == "O1" or noisecurve == "O2":
             if ifo == 'V1':
-                psds.append(pycbc.psd.AdVEarlyHighSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.AdVEarlyHighSensitivityP1200087(flen, delta_f, flow))
             elif ifo == 'H1' or ifo == 'L1':
-                psds.append(pycbc.psd.aLIGOEarlyHighSensitivityP1200087(flen, delta_f, flow) )
+                psds.append(pycbc.psd.aLIGOEarlyHighSensitivityP1200087(flen, delta_f, flow))
 
         elif noisecurve=="O3":
             if ifo == 'H1':
-                psds.append(pycbc.psd.from_txt('T2000012_aligo_O3actual_H1.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt(
+                    os.path.join(get_data_folder_path(), 'T2000012_aligo_O3actual_H1.txt'),
+                    flen, delta_f, flow, is_asd_file=True))
             elif ifo=='L1':
-                psds.append(pycbc.psd.from_txt('T2000012_aligo_O3actual_L1.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt(
+                    os.path.join(get_data_folder_path(), 'T2000012_aligo_O3actual_L1.txt'),
+                    flen, delta_f,flow, is_asd_file=True))
             elif ifo=='V1':
-                psds.append(pycbc.psd.from_txt('T2000012_avirgo_O3actual.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt(
+                    os.path.join(get_data_folder_path(), 'T2000012_avirgo_O3actual.txt'),
+                    flen, delta_f, flow, is_asd_file=True))
 
         elif noisecurve=="O4":
             if ifo == 'V1':
-                psds.append(pycbc.psd.from_txt('T2000012_avirgo_O4high_NEW.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt(
+                    os.path.join(get_data_folder_path(), 'T2000012_avirgo_O4high_NEW.txt'),
+                    flen, delta_f, flow, is_asd_file=True))
             elif ifo == 'H1' or ifo == 'L1':
-                psds.append(pycbc.psd.from_txt('T2000012_aligo_O4high.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt(
+                    os.path.join(get_data_folder_path(), 'T2000012_aligo_O4high.txt'),
+                    flen, delta_f, flow, is_asd_file=True))
         else:
             raise ValueError
 
@@ -163,7 +185,7 @@ def calculate_snr(args):
     # Return the SNR in each detector and construct the network SNR later on
     return snrs
 
-def evaluate_binaries(inbinaries, ifos=['H1','L1','V1'], ncore=1, approximant='IMRPhenomXPHM', noisecurve='design', SNRthreshold=12):
+def evaluate_binaries(inbinaries, ifos=['H1','L1','V1'], approximant='IMRPhenomXPHM', noisecurve='design', SNRthreshold=12):
     '''
     Compute the SNRs of a set of binaries
     '''
@@ -172,41 +194,55 @@ def evaluate_binaries(inbinaries, ifos=['H1','L1','V1'], ncore=1, approximant='I
     
     # Prepare detectors and PSDs
     flow=20.0
-    fhigh=2048.
+    fhigh=1024.
     geocent_time=0.
-    delta_f=1/64.
-    flen=int(fhigh / delta_f) + 1
     phi_c=0.
 
     # Populate binaries with additional parameters
-    # NOTE These hyperparameters should also be binary dependent!
-    binaries['flow'] = np.ones(binaries['N'])*flow
-    binaries['fhigh'] = np.ones(binaries['N'])*fhigh
     binaries['geocent_time'] = np.ones(binaries['N'])*geocent_time
-    binaries['delta_f'] = np.ones(binaries['N'])*delta_f
-    binaries['flen'] = np.ones(binaries['N'], dtype=int)*flen
     binaries['phi_c'] = np.ones(binaries['N'])*phi_c
     binaries['m1z'] = binaries['mtot']/(1+binaries['q'])
     binaries['m2z'] = binaries['q']*binaries['m1z']
     binaries['lumdist'] = astropy.cosmology.Planck15.luminosity_distance(binaries['z']).value # Mpc
+    # These will be populated later
+    binaries['flow'] = np.zeros_like(binaries['geocent_time'])
+    binaries['fhigh'] = np.zeros_like(binaries['geocent_time'])
+    binaries['delta_f'] = np.zeros_like(binaries['geocent_time'])
+    binaries['flen'] = np.zeros_like(binaries['geocent_time'])
 
-    with MultiPool(ncore) as pool:
-        output_snrs = list(
-            tqdm(
-                pool.imap(
-                    calculate_snr,
-                    [({k: binaries[k][i] for k in binaries.keys() if k != 'N'}, ifos, approximant, noisecurve) for i in range(binaries['N'])],
-                ),
-                total=binaries['N'],
+    output_snrs = []
+    for i in tqdm(range(binaries['N'])):
+        this_binary = {k: binaries[k][i] for k in binaries.keys() if k != 'N'}
+        this_binary['flow'] = flow
+        this_binary['fhigh'] = fhigh
+        try:
+            signal_duration = pycbc.pnutils.get_imr_duration(
+                this_binary['m1z'], this_binary['m2z'], this_binary['chi1z'], this_binary['chi2z'], this_binary['flow'],
+                approximant="SEOBNRv5",
             )
-        )
+            if signal_duration < 4:
+                this_binary['delta_f'] = 0.25
+            else:
+                this_binary['delta_f'] = 2**(-np.ceil(np.log2(signal_duration)))
+            this_binary['flen'] = int(this_binary['fhigh'] / this_binary['delta_f']) + 1
+            output_snrs.append(
+                calculate_snr([this_binary, ifos, approximant, noisecurve])
+            )
+            binaries['flow'][i] = this_binary['flow']
+            binaries['fhigh'][i] = this_binary['fhigh']
+            binaries['delta_f'][i] = this_binary['delta_f']
+            binaries['flen'][i] = this_binary['flen']
+        except Exception as e:
+            print(f"Error occurred while computing signal duration for binary {i}: {e}")
+            output_snrs.append([0]*len(ifos))  # Append zeros if an error occurs
+            continue
 
-    binaries['snr']=np.array(output_snrs)
+    binaries['snr'] = np.array(output_snrs)
     binaries['network_snr'] = np.linalg.norm(binaries['snr'], axis=1)
 
     # Detectability: 1 means "detected", 0 means "not detected"
     # NOTE Maybe implement "Quick recipes for gravitational-wave selection effects" here
-    binaries['det']= np.where(binaries['network_snr']>SNRthreshold , 1,0 )
+    binaries['det'] = np.where(binaries['network_snr']>SNRthreshold, 1, 0 )
 
     return binaries
 

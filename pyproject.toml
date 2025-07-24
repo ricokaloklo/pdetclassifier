@@ -10,7 +10,6 @@ dependencies = [
     "numpy",
     "astropy",
     "pycbc",
-    "schwimmbad",
     "tqdm",
     "torch",
 ]
