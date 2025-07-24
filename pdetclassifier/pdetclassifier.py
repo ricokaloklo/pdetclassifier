@@ -94,28 +94,28 @@ def get_psds(ifos, flow, delta_f, flen, noisecurve="design"):
         if noisecurve=="design" or noisecurve=="Design":
             if ifo == 'V1':
                 psds.append(pycbc.psd.AdVDesignSensitivityP1200087(flen, delta_f, flow) )
-            else:
+            elif ifo == 'H1' or ifo == 'L1':
                 psds.append(pycbc.psd.aLIGODesignSensitivityP1200087(flen, delta_f, flow) )
 
         elif noisecurve=="O1O2":
             if ifo == 'V1':
                 psds.append(pycbc.psd.AdVEarlyHighSensitivityP1200087(flen, delta_f, flow) )
-            else:
+            elif ifo == 'H1' or ifo == 'L1':
                 psds.append(pycbc.psd.aLIGOEarlyHighSensitivityP1200087(flen, delta_f, flow) )
 
         elif noisecurve=="O3":
             if ifo == 'H1':
-                psds.append(pycbc.psd.from_txt('./T2000012_aligo_O3actual_H1.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('T2000012_aligo_O3actual_H1.txt', flen, delta_f,flow, is_asd_file=True) )
             elif ifo=='L1':
-                psds.append(pycbc.psd.from_txt('./T2000012_aligo_O3actual_L1.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('T2000012_aligo_O3actual_L1.txt', flen, delta_f,flow, is_asd_file=True) )
             elif ifo=='V1':
-                psds.append(pycbc.psd.from_txt('./T2000012_avirgo_O3actual.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('T2000012_avirgo_O3actual.txt', flen, delta_f,flow, is_asd_file=True) )
 
         elif noisecurve=="O4":
             if ifo == 'V1':
-                psds.append(pycbc.psd.from_txt('./T2000012_avirgo_O4high_NEW.txt', flen, delta_f,flow, is_asd_file=True) )
-            else:
-                psds.append(pycbc.psd.from_txt('./T2000012_aligo_O4high.txt', flen, delta_f,flow, is_asd_file=True) )
+                psds.append(pycbc.psd.from_txt('T2000012_avirgo_O4high_NEW.txt', flen, delta_f,flow, is_asd_file=True) )
+            elif ifo == 'H1' or ifo == 'L1':
+                psds.append(pycbc.psd.from_txt('T2000012_aligo_O4high.txt', flen, delta_f,flow, is_asd_file=True) )
         else:
             raise ValueError
 
