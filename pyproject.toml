@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdetclassifier"
+description = "Gravitational-wave selection effects using neural-network classifiers"
+version = "0.1.0"
+dependencies = [
+    "numpy",
+    "astropy",
+    "pycbc",
+    "schwimmbad",
+    "tqdm",
+    "torch",
+]
+requires-python = ">=3.9"
+authors = [
+  {name = "Davide Gerosa", email = "davide.gerosa@unimib.it"},
+  {name = "Rico Ka Lok Lo", email = "ka-lok.lo@ligo.org"},
+]
+readme = "README.md"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["pdetclassifier"]
+
+[tool.setuptools.package-data]
+pdetclassifier = [
+    "data/T2000012_aligo_O3actual_H1.txt",
+    "data/T2000012_aligo_O3actual_L1.txt",
+    "data/T2000012_avirgo_O3actual.txt",
+    "data/T2000012_aligo_O4high.txt",
+    "data/T2000012_avirgo_O4high_NEW.txt",
+]
