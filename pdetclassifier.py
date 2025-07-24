@@ -1,9 +1,9 @@
-import sys, os, time,copy
+import os, copy
+import pickle
 from tqdm import tqdm
+from schwimmbad import MultiPool
 
 import numpy as np
-import scipy.integrate
-
 import astropy.cosmology
 
 import pycbc.psd
@@ -11,35 +11,18 @@ import pycbc.detector
 import pycbc.waveform
 import pycbc.filter
 
-# Multi-processing
-from schwimmbad import MultiPool
-
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch import optim
 from torch.utils import data
 
-import pickle
-
-
-def sperical_to_cartesian(mag,theta,phi):
-    '''
-    Convert spherical to cartesian coordinates
-    '''
-
-    coordx = mag * np.cos(phi) * np.sin(theta)
-    coordy = mag * np.sin(phi) * np.sin(theta)
-    coordz = mag * np.cos(theta)
-
-    return coordx,coordy,coordz
-
-
+# Specify the parameterization
 massvar = ['mtot','q','z']
 spinvar = ['chi1x','chi1y','chi1z','chi2x','chi2y','chi2z']
-intrvar=massvar+spinvar
+intrvar = massvar + spinvar
 extrvar = ['iota','ra','dec','psi']
-train_variables=intrvar+extrvar
+train_variables = intrvar + extrvar
 
 def lookup_limits():
     '''
@@ -64,6 +47,16 @@ def lookup_limits():
 
     return limits
 
+def sperical_to_cartesian(mag,theta,phi):
+    '''
+    Convert spherical to cartesian coordinates
+    '''
+
+    coordx = mag * np.cos(phi) * np.sin(theta)
+    coordy = mag * np.sin(phi) * np.sin(theta)
+    coordz = mag * np.cos(theta)
+
+    return coordx,coordy,coordz
 
 def generate_binaries(N):
     '''
@@ -167,12 +160,10 @@ def calculate_snr(args):
         maxsnr, _ = snr_opt.abs_max_loc()
         snrs.append(maxsnr)
 
-    # Sum in quarature for the network SNR
-    # np.linalg.norm(snrs)
     # Return the SNR in each detector and construct the network SNR later on
     return snrs
 
-def evaluate_binaries(inbinaries, ncore=1, approximant='IMRPhenomXPHM', noisecurve='design', SNRthreshold=12):
+def evaluate_binaries(inbinaries, ifos=['H1','L1','V1'], ncore=1, approximant='IMRPhenomXPHM', noisecurve='design', SNRthreshold=12):
     '''
     Compute the SNRs of a set of binaries
     '''
@@ -180,17 +171,15 @@ def evaluate_binaries(inbinaries, ncore=1, approximant='IMRPhenomXPHM', noisecur
     binaries = copy.deepcopy(inbinaries)
     
     # Prepare detectors and PSDs
-    ifos=['H1','L1','V1']
-
-    # Populate binaries with additional parameters
-    # NOTE These hyperparameters should also be binary dependent!
     flow=20.0
     fhigh=2048.
     geocent_time=0.
     delta_f=1/64.
     flen=int(fhigh / delta_f) + 1
     phi_c=0.
-    
+
+    # Populate binaries with additional parameters
+    # NOTE These hyperparameters should also be binary dependent!
     binaries['flow'] = np.ones(binaries['N'])*flow
     binaries['fhigh'] = np.ones(binaries['N'])*fhigh
     binaries['geocent_time'] = np.ones(binaries['N'])*geocent_time
@@ -295,7 +284,18 @@ class LabeledDataset(data.Dataset):
     def __len__(self):
         return self.length
 
-def trainnetwork_with_torch(train_binaries, test_binaries, filename='train.pt'):
+def loadnetwork(filename,verbose=False):
+    '''
+    Load a trained neural network
+    '''
+
+    model = torch.load(filename, weights_only=False)
+    if verbose:
+        print(model.__str__())
+
+    return model
+
+def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_model.pt', lr=1e-2, batch_size=1024, nepoch=50):
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     # Set default dtype
     torch.set_default_dtype(torch.float32)
@@ -336,8 +336,8 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='train.pt'):
         train_dataset = LabeledDataset(train_in, train_out)
         test_dataset = LabeledDataset(test_in, test_out)
 
-        train_batch_size = 1024
-        validate_batch_size = train_batch_size
+        train_batch_size = batch_size
+        validate_batch_size = batch_size # NOTE Does not have to be the same as train_batch_size
         train_dataloader = data.DataLoader(
             train_dataset,
             batch_size=train_batch_size,
@@ -352,9 +352,7 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='train.pt'):
         # Loss function: binary cross entropy
         loss_fn = nn.BCELoss()
 
-        lr = 1e-2 # learning rate
         optimizer = optim.Adam(model.parameters(), lr=lr)
-        nepoch = 150
         # Trying to reproduce Davide's learning rate schedule with torch
         scheduler = optim.lr_scheduler.SequentialLR(
             optimizer,
@@ -397,21 +395,9 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='train.pt'):
 
             scheduler.step()
     else:
-        model = torch.load(filename)
+        model = loadnetwork(filename, verbose=False)
 
     return model
-
-def loadnetwork(filename,verbose=False):
-    '''
-    Load a trained neural network
-    '''
-
-    model = torch.load(filename)
-    if verbose:
-        print(model.__str__())
-
-    return model
-
 
 def predictnetwork(model, binaries):
     '''
