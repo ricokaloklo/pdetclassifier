@@ -15,6 +15,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch import optim
 from torch.utils import data
+from torch.cuda.amp import autocast, GradScaler
 
 import pdetclassifier
 
@@ -331,14 +332,31 @@ def loadnetwork(filename,verbose=False):
 
     return model
 
+def create_balanced_sampler(labels):
+    # Convert to tensor if needed
+    labels = torch.tensor(labels, dtype=torch.long)
+
+    class_counts = torch.bincount(labels)
+    class_weights = 1. / class_counts.float()
+    sample_weights = class_weights[labels]
+
+    sampler = data.WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),  # or a fixed epoch size
+        replacement=True
+    )
+
+    return sampler
+
 def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_model.pt', lr=1e-2, batch_size=1024, nepoch=50):
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    # Set default dtype
-    torch.set_default_dtype(torch.float32)
 
     def init_weights(m):
         if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
 
     if not os.path.isfile(filename):
         train_in = nnet_in(train_binaries) # binary parameters
@@ -350,13 +368,15 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_mod
         # Define neural network architecture
         model = nn.Sequential(
             nn.Linear(nfeatures, 32),
-            nn.Tanh(),
+            nn.LayerNorm(32),
+            nn.ReLU(),
             nn.Linear(32, 16),
-            nn.Tanh(),
+            nn.LayerNorm(16),
+            nn.ReLU(),
             nn.Linear(16, 8),
-            nn.Tanh(),
+            nn.LayerNorm(8),
+            nn.ReLU(),
             nn.Linear(8, 1),
-            nn.Sigmoid(),
         )
 
         # Initialize the weights for the linear layers
@@ -364,11 +384,15 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_mod
         # Move model to device (GPU or CPU)
         model.to(device)
 
+        training_sampler = create_balanced_sampler(train_out)
+        testing_sampler = create_balanced_sampler(test_out)
+
         # Prepare the data and move to device
         train_in = torch.from_numpy(train_in.astype(np.float32)).to(device)
         train_out = torch.from_numpy(train_out.astype(np.float32)).to(device) # Either 0 or 1
         test_in = torch.from_numpy(test_in.astype(np.float32)).to(device)
         test_out = torch.from_numpy(test_out.astype(np.float32)).to(device)
+
         train_dataset = LabeledDataset(train_in, train_out)
         test_dataset = LabeledDataset(test_in, test_out)
 
@@ -377,16 +401,16 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_mod
         train_dataloader = data.DataLoader(
             train_dataset,
             batch_size=train_batch_size,
-            shuffle=True,
+            sampler=training_sampler,
         )
         test_dataloader = data.DataLoader(
             test_dataset,
             batch_size=validate_batch_size,
-            shuffle=True,
+            sampler=testing_sampler,
         )
 
         # Loss function: binary cross entropy
-        loss_fn = nn.BCELoss()
+        loss_fn = nn.BCEWithLogitsLoss()
 
         optimizer = optim.Adam(model.parameters(), lr=lr)
         # Trying to reproduce Davide's learning rate schedule with torch
@@ -398,20 +422,24 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_mod
             ],
             milestones=[10],
         )
+
         tbar = tqdm(range(nepoch))
 
         # Training loop
         best_score = -np.inf
+        scaler = GradScaler()
         for step in tbar:
             # In each epoch
             model.train()
 
             for _, batch_data in enumerate(train_dataloader):
                 batch_in, batch_label = batch_data
+
                 optimizer.zero_grad()
-                output = model(batch_in).squeeze()
+                output = model(batch_in).view(-1)
                 loss = loss_fn(output, batch_label)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             # Check for accuracy on the validation set
@@ -429,6 +457,8 @@ def trainnetwork_with_torch(train_binaries, test_binaries, filename='trained_mod
                     best_score = test_accuracy
                     torch.save(model, filename)
 
+            print(f"BCE loss at step {step}: {loss.item()}")
+
             scheduler.step()
     else:
         model = loadnetwork(filename, verbose=False)
@@ -444,9 +474,9 @@ def predictnetwork(model, binaries):
 
     model.eval()
     with torch.no_grad():
-        pass
-    # Return the class (0 or 1) that is preferred
-    predictions = np.squeeze((model(inputs) > 0.5).detach().cpu().numpy().astype("int32"))
+        # Return the class (0 or 1) that is preferred
+        predictions = np.squeeze((model(inputs) > 0.5).detach().cpu().numpy().astype("int16"))
+
     return predictions
 
 def keep_splitting(binaries, target_N):
@@ -490,7 +520,7 @@ def _pdet(model,binaries, Nmc = 10000):
     model.eval()
     with torch.no_grad():
         # Apply network
-        predictions =  np.reshape( np.squeeze(( model(both)> 0.5).detach().cpu().numpy().astype("int32")), (N,Nmc) )
+        predictions =  np.reshape( np.squeeze(( model(both)> 0.5).detach().cpu().numpy().astype("int16")), (N,Nmc) )
 
     # Approximante integral with monte carlo sum
     pdet_mc = np.sum(predictions,axis=1)/Nmc
